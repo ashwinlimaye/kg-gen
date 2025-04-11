@@ -2,6 +2,7 @@ import os
 import sys
 import nltk
 import argparse
+import traceback
 from kg_gen import KGGen
 
 def parse_arguments():
@@ -82,13 +83,44 @@ def sanitize_for_neo4j(text):
     
     return text
 
+# --- Repair Broken Relations Function ---
+def repair_relations(raw_relations_list):
+    """Fix relations that were output as strings instead of tuples"""
+    if not raw_relations_list:
+        return []
+        
+    # Check if we already have properly formatted tuples
+    if isinstance(raw_relations_list, list) and all(isinstance(x, tuple) and len(x) == 3 for x in raw_relations_list):
+        return raw_relations_list
+        
+    # If we have strings instead of tuples, try to convert them
+    fixed_relations = []
+    
+    # Process in groups of three
+    i = 0
+    while i < len(raw_relations_list) - 2:
+        try:
+            source = raw_relations_list[i].strip()
+            relation = raw_relations_list[i+1].strip()
+            target = raw_relations_list[i+2].strip()
+            
+            # Skip empty values
+            if source and relation and target:
+                fixed_relations.append((source, relation, target))
+            
+            i += 3
+        except (IndexError, AttributeError):
+            i += 1  # Skip problematic entries
+    
+    return fixed_relations
+
 # --- Main Script ---
 def main():
     args = parse_arguments()
     
     # --- Configuration ---
     OPENAI_MODEL_NAME = args.model
-    MAX_TOKENS = 1000
+    MAX_TOKENS = 10000
     GRAPH_NAME = args.graphname
     
     # --- Prerequisites Check ---
@@ -141,7 +173,41 @@ def main():
     # --- Knowledge Graph Extraction ---
     try:
         print("\n--- Extracting Knowledge Graph ---")
-        graph = kg.generate(input_data=input_text, context=args.context)
+        
+        # First try to generate the graph normally
+        try:
+            graph = kg.generate(input_data=input_text, context=args.context)
+        except Exception as e:
+            # If we get a validation error for the relations, try to fix the relations
+            print("Encountered error in relations format, attempting to repair...")
+            
+            # First extract entities
+            entities = kg.get_entities(input_text, context=args.context)
+            print(f"Successfully extracted {len(entities)} entities")
+            
+            # Then get raw relations (this might fail validation)
+            try:
+                # Direct access to internal method to get raw relations
+                raw_relations = kg.dspy.Predict(kg_gen.steps._2_get_relations.TextRelations)(
+                    source_text=input_text, 
+                    entities=entities,
+                    context=args.context
+                ).relations
+                
+                # Repair the relations format
+                fixed_relations = repair_relations(raw_relations)
+                print(f"Repaired {len(fixed_relations)} relationships")
+                
+                # Create a graph manually
+                from kg_gen.models import Graph
+                graph = Graph(
+                    entities=entities,
+                    relations=fixed_relations,
+                    edges=[(s, t) for s, _, t in fixed_relations]
+                )
+            except Exception as repair_error:
+                print(f"Repair attempt failed: {repair_error}")
+                raise e  # Re-raise the original error
         
         print("\n--- Results ---")
         print(f"Entities: {graph.entities}")
@@ -236,7 +302,6 @@ def main():
         
     except Exception as e:
         print(f"Error generating knowledge graph: {e}")
-        import traceback
         traceback.print_exc()
         exit(1)
 
